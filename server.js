@@ -1,7 +1,6 @@
 const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
-const urlLib = require("url");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,9 +13,16 @@ function resolveUrl(base, relative) {
     }
 }
 
-// ------------------------
-// MAIN PROXY HTML ROUTE
-// ------------------------
+// -----------------------------
+// COOKIE STORAGE (basic per request)
+// -----------------------------
+function forwardCookies(req) {
+    return req.headers.cookie || "";
+}
+
+// -----------------------------
+// MAIN PROXY ROUTE
+// -----------------------------
 app.get("/proxy", async (req, res) => {
     const target = req.query.url;
     if (!target) return res.send("No URL provided");
@@ -25,16 +31,19 @@ app.get("/proxy", async (req, res) => {
         const response = await axios.get(target, {
             responseType: "text",
             headers: {
-                "User-Agent": "Mozilla/5.0"
+                "User-Agent": "Mozilla/5.0",
+                "Cookie": forwardCookies(req)
             }
         });
 
         const $ = cheerio.load(response.data);
 
-        // Rewrite ALL links
+        // -----------------------------
+        // REWRITE LINKS (navigation)
+        // -----------------------------
         $("a").each((_, el) => {
             const href = $(el).attr("href");
-            if (href) {
+            if (href && !href.startsWith("javascript:")) {
                 $(el).attr(
                     "href",
                     "/proxy?url=" + resolveUrl(target, href)
@@ -42,7 +51,9 @@ app.get("/proxy", async (req, res) => {
             }
         });
 
-        // Rewrite images
+        // -----------------------------
+        // IMAGES
+        // -----------------------------
         $("img").each((_, el) => {
             const src = $(el).attr("src");
             if (src) {
@@ -53,7 +64,9 @@ app.get("/proxy", async (req, res) => {
             }
         });
 
-        // Rewrite scripts
+        // -----------------------------
+        // SCRIPTS
+        // -----------------------------
         $("script[src]").each((_, el) => {
             const src = $(el).attr("src");
             if (src) {
@@ -64,7 +77,9 @@ app.get("/proxy", async (req, res) => {
             }
         });
 
-        // Rewrite CSS files
+        // -----------------------------
+        // CSS FILES
+        // -----------------------------
         $("link[href]").each((_, el) => {
             const href = $(el).attr("href");
             if (href) {
@@ -75,19 +90,36 @@ app.get("/proxy", async (req, res) => {
             }
         });
 
-        // Inject base tag (helps relative navigation)
+        // -----------------------------
+        // FIX INLINE CSS url(...)
+        // (THIS is a BIG v3 upgrade)
+        // -----------------------------
+        $("style").each((_, el) => {
+            let css = $(el).html();
+
+            css = css.replace(/url\(["']?(.*?)["']?\)/g, (match, p1) => {
+                const fixed = resolveUrl(target, p1);
+                return `url("/asset?url=${fixed}")`;
+            });
+
+            $(el).html(css);
+        });
+
+        // -----------------------------
+        // BASE TAG (fix relative navigation)
+        // -----------------------------
         $("head").prepend(`<base href="${target}">`);
 
         res.send($.html());
 
     } catch (err) {
-        res.send("Error loading page");
+        res.send("Proxy error loading page");
     }
 });
 
-// ------------------------
-// ASSET PROXY (images/css/js)
-// ------------------------
+// -----------------------------
+// ASSET PROXY (images/css/js/etc)
+// -----------------------------
 app.get("/asset", async (req, res) => {
     const target = req.query.url;
     if (!target) return res.send("No asset URL");
@@ -100,14 +132,16 @@ app.get("/asset", async (req, res) => {
             }
         });
 
-        res.setHeader("Content-Type", response.headers["content-type"]);
+        const contentType = response.headers["content-type"];
+        res.setHeader("Content-Type", contentType);
+
         res.send(response.data);
 
     } catch (err) {
-        res.send("Asset load error");
+        res.send("Asset error");
     }
 });
 
 app.listen(PORT, () => {
-    console.log("V2 Proxy running on port " + PORT);
+    console.log("V3 Proxy Engine running on port " + PORT);
 });
