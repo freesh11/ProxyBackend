@@ -2,29 +2,34 @@ const express = require("express");
 const axios   = require("axios");
 const cheerio = require("cheerio");
 const urlLib  = require("url");
-const fs      = require("fs");
-const path    = require("path");
+const { Pool } = require("pg");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Storage ──────────────────────────────────────────────────────────────────
-// Flat JSON file: { [username_lowercase]: { username, hash, config } }
-// Lives next to server.js; survives restarts automatically.
-const DB_PATH = path.join(__dirname, "accounts.json");
+// ── Database ──────────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: "postgresql://server_login_mgr_user:TrqUTHQt5H29h5oHlDglqGKuUGRTokNA@dpg-d7knlipj2pic73cbng30-a.ohio-postgres.render.com/server_login_mgr",
+  ssl: { rejectUnauthorized: false },
+});
 
-function readDB() {
-  try { return JSON.parse(fs.readFileSync(DB_PATH, "utf8")); }
-  catch (_) { return {}; }
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      username   TEXT PRIMARY KEY,
+      hash       TEXT NOT NULL,
+      config     TEXT,
+      created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      saved_at   BIGINT
+    )
+  `);
+  console.log("Database ready");
 }
-function writeDB(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-}
+initDB().catch(err => console.error("DB init error:", err));
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-app.use(express.json({ limit: "50mb" })); // configs can include base64 photos
+app.use(express.json({ limit: "50mb" }));
 
-// CORS — allow the HTML file to call from any origin
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -33,137 +38,99 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function resolveUrl(base, relative) {
-  return urlLib.resolve(base, relative);
-}
-function authOk(db, key, hash) {
-  const u = db[key];
-  return u && u.hash === hash;
-}
+function resolveUrl(base, relative) { return urlLib.resolve(base, relative); }
+function ok(res, data)  { res.json({ ok: true,  ...data }); }
+function fail(res, msg) { res.json({ ok: false, error: msg }); }
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
 
-// POST /auth/register  { username, hash }
-app.post("/auth/register", (req, res) => {
+// POST /auth/register
+app.post("/auth/register", async (req, res) => {
   const { username, hash } = req.body || {};
-  if (!username || !hash)
-    return res.json({ ok: false, error: "Missing username or hash" });
-
+  if (!username || !hash) return fail(res, "Missing username or hash");
   const key = username.trim().toLowerCase();
-  if (key.length < 2 || key.length > 32)
-    return res.json({ ok: false, error: "Username must be 2-32 characters" });
-  if (!/^[a-z0-9_.-]+$/.test(key))
-    return res.json({ ok: false, error: "Username may only contain letters, numbers, _ . -" });
-
-  const db = readDB();
-  if (db[key])
-    return res.json({ ok: false, error: "Username already taken" });
-
-  db[key] = { username: username.trim(), hash, config: null, createdAt: Date.now() };
-  writeDB(db);
-  res.json({ ok: true, username: username.trim() });
-});
-
-// POST /auth/login  { username, hash }
-app.post("/auth/login", (req, res) => {
-  const { username, hash } = req.body || {};
-  if (!username || !hash)
-    return res.json({ ok: false, error: "Missing credentials" });
-
-  const db  = readDB();
-  const key = username.trim().toLowerCase();
-  const u   = db[key];
-
-  if (!u || u.hash !== hash)
-    return res.json({ ok: false, error: "Invalid username or password" });
-
-  res.json({ ok: true, username: u.username, config: u.config });
-});
-
-// POST /auth/save-config  { username, hash, config }
-app.post("/auth/save-config", (req, res) => {
-  const { username, hash, config } = req.body || {};
-  if (!username || !hash)
-    return res.json({ ok: false, error: "Missing credentials" });
-
-  const db  = readDB();
-  const key = username.trim().toLowerCase();
-
-  if (!authOk(db, key, hash))
-    return res.json({ ok: false, error: "Unauthorized" });
-
-  db[key].config = config;
-  db[key].savedAt = Date.now();
-  writeDB(db);
-  res.json({ ok: true });
-});
-
-// GET /auth/load-config?username=&hash=
-app.get("/auth/load-config", (req, res) => {
-  const { username, hash } = req.query || {};
-  if (!username || !hash)
-    return res.json({ ok: false, error: "Missing credentials" });
-
-  const db  = readDB();
-  const key = username.trim().toLowerCase();
-
-  if (!authOk(db, key, hash))
-    return res.json({ ok: false, error: "Unauthorized" });
-
-  res.json({ ok: true, config: db[key].config });
-});
-
-// POST /auth/delete  { username, hash }
-app.post("/auth/delete", (req, res) => {
-  const { username, hash } = req.body || {};
-  if (!username || !hash)
-    return res.json({ ok: false, error: "Missing credentials" });
-
-  const db  = readDB();
-  const key = username.trim().toLowerCase();
-
-  if (!authOk(db, key, hash))
-    return res.json({ ok: false, error: "Unauthorized" });
-
-  delete db[key];
-  writeDB(db);
-  res.json({ ok: true });
-});
-
-// ── Original proxy endpoint (unchanged) ──────────────────────────────────────
-app.get("/proxy", async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.send("No URL provided");
-
+  if (key.length < 2 || key.length > 32) return fail(res, "Username must be 2-32 characters");
+  if (!/^[a-z0-9_.\-]+$/.test(key)) return fail(res, "Username may only contain letters, numbers, _ . -");
   try {
-    const response = await axios.get(target, {
-      responseType: "text",
-      headers: { "User-Agent": "Mozilla/5.0" }
-    });
-
-    const $ = cheerio.load(response.data);
-
-    $("a").each((_, el) => {
-      let href = $(el).attr("href");
-      if (href) {
-        $(el).attr("href", "/proxy?url=" + resolveUrl(target, href));
-      }
-    });
-
-    res.send($.html());
-  } catch (err) {
-    res.send("Error loading page");
+    await pool.query("INSERT INTO accounts (username, hash) VALUES ($1, $2)", [key, hash]);
+    ok(res, { username: username.trim() });
+  } catch (e) {
+    if (e.code === "23505") return fail(res, "Username already taken");
+    console.error(e); fail(res, "Server error");
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// POST /auth/login
+app.post("/auth/login", async (req, res) => {
+  const { username, hash } = req.body || {};
+  if (!username || !hash) return fail(res, "Missing credentials");
+  const key = username.trim().toLowerCase();
+  try {
+    const { rows } = await pool.query("SELECT username, hash, config FROM accounts WHERE username = $1", [key]);
+    const u = rows[0];
+    if (!u || u.hash !== hash) return fail(res, "Invalid username or password");
+    ok(res, { username: u.username, config: u.config ? JSON.parse(u.config) : null });
+  } catch (e) { console.error(e); fail(res, "Server error"); }
+});
+
+// POST /auth/save-config
+app.post("/auth/save-config", async (req, res) => {
+  const { username, hash, config } = req.body || {};
+  if (!username || !hash) return fail(res, "Missing credentials");
+  const key = username.trim().toLowerCase();
+  try {
+    const { rows } = await pool.query("SELECT hash FROM accounts WHERE username = $1", [key]);
+    if (!rows[0] || rows[0].hash !== hash) return fail(res, "Unauthorized");
+    await pool.query("UPDATE accounts SET config = $1, saved_at = $2 WHERE username = $3",
+      [JSON.stringify(config), Date.now(), key]);
+    ok(res);
+  } catch (e) { console.error(e); fail(res, "Server error"); }
+});
+
+// GET /auth/load-config
+app.get("/auth/load-config", async (req, res) => {
+  const { username, hash } = req.query || {};
+  if (!username || !hash) return fail(res, "Missing credentials");
+  const key = username.trim().toLowerCase();
+  try {
+    const { rows } = await pool.query("SELECT hash, config FROM accounts WHERE username = $1", [key]);
+    const u = rows[0];
+    if (!u || u.hash !== hash) return fail(res, "Unauthorized");
+    ok(res, { config: u.config ? JSON.parse(u.config) : null });
+  } catch (e) { console.error(e); fail(res, "Server error"); }
+});
+
+// POST /auth/delete
+app.post("/auth/delete", async (req, res) => {
+  const { username, hash } = req.body || {};
+  if (!username || !hash) return fail(res, "Missing credentials");
+  const key = username.trim().toLowerCase();
+  try {
+    const { rows } = await pool.query("SELECT hash FROM accounts WHERE username = $1", [key]);
+    if (!rows[0] || rows[0].hash !== hash) return fail(res, "Unauthorized");
+    await pool.query("DELETE FROM accounts WHERE username = $1", [key]);
+    ok(res);
+  } catch (e) { console.error(e); fail(res, "Server error"); }
+});
+
+// ── Proxy (unchanged) ─────────────────────────────────────────────────────────
+app.get("/proxy", async (req, res) => {
+  const target = req.query.url;
+  if (!target) return res.send("No URL provided");
+  try {
+    const response = await axios.get(target, {
+      responseType: "text",
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    const $ = cheerio.load(response.data);
+    $("a").each((_, el) => {
+      const href = $(el).attr("href");
+      if (href) $(el).attr("href", "/proxy?url=" + resolveUrl(target, href));
+    });
+    res.send($.html());
+  } catch (e) { res.send("Error loading page"); }
+});
+
 app.listen(PORT, () => {
-  console.log(`\nProxy+Auth server running on port ${PORT}`);
-  console.log(`  POST /auth/register     — create account`);
-  console.log(`  POST /auth/login        — sign in + load config`);
-  console.log(`  POST /auth/save-config  — push full desktop config`);
-  console.log(`  GET  /auth/load-config  — pull full desktop config`);
-  console.log(`  POST /auth/delete       — delete account`);
-  console.log(`  GET  /proxy?url=        — web proxy (unchanged)\n`);
+  console.log("Server running on port " + PORT);
 });
