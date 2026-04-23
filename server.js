@@ -133,4 +133,15 @@ app.get("/proxy", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
+
+  // ── Keep-alive: ping self every 14 minutes so Render free tier never spins down ──
+  // Render spins down after 15min inactivity — this stays well inside that window.
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(() => {
+    require("http").get(SELF_URL, res => {
+      console.log(`[keep-alive] ping → ${res.statusCode}`);
+    }).on("error", e => {
+      console.log(`[keep-alive] ping failed: ${e.message}`);
+    });
+  }, 14 * 60 * 1000); // 14 minutes
 });
