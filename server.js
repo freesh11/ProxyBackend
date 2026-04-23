@@ -113,7 +113,32 @@ app.post("/auth/delete", async (req, res) => {
   } catch (e) { console.error(e); fail(res, "Server error"); }
 });
 
-// ── Proxy (unchanged) ─────────────────────────────────────────────────────────
+// ── Render API proxy — forwards requests to api.render.com server-side (avoids CORS) ──
+const RENDER_API_KEY = 'rnd_fxIXYSbs0NJWajIOVoIWDILZUECH';
+
+app.all("/render-api/*", async (req, res) => {
+  const path = req.params[0];
+  const query = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
+  const url = `https://api.render.com/v1/${path}${query}`;
+  try {
+    const response = await axios({
+      method: req.method,
+      url,
+      headers: {
+        'Authorization': `Bearer ${RENDER_API_KEY}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      data: ['POST','PUT','PATCH'].includes(req.method) ? req.body : undefined,
+      validateStatus: () => true,
+    });
+    res.status(response.status).json(response.data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Web proxy ─────────────────────────────────────────────────────────────────
 app.get("/proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.send("No URL provided");
