@@ -225,6 +225,18 @@ app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'Desktop Simulator Backend', time: new Date().toISOString() });
 });
 
+// ── Self-ping keepalive (prevents Render free tier from sleeping) ──────────────
+// Pings itself every 10 minutes. Render spins down after ~15 min of inactivity.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(async () => {
+  try {
+    const r = await fetch(`${SELF_URL}/`);
+    console.log(`[keepalive] ping → ${r.status}`);
+  } catch (e) {
+    console.warn(`[keepalive] ping failed: ${e.message}`);
+  }
+}, 10 * 60 * 1000); // every 10 minutes
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 initDB()
   .then(() => {
