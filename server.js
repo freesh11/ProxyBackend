@@ -9,36 +9,59 @@
  *   POST /auth/delete         — delete account + config
  *
  *   POST /render-api/*        — proxy to api.render.com (CORS-safe)
+ *   POST /admin/*             — admin panel routes (password protected)
  *
- * Environment variables (set in Render dashboard):
- *   DATABASE_URL   — PostgreSQL connection string
- *   PORT           — (optional, defaults to 3000)
+ * Environment variables (optional — fallbacks are hardcoded below):
+ *   DATABASE_URL              — PostgreSQL connection string
+ *   PORT                      — defaults to 10000
  */
 
 const express  = require('express');
 const { Pool } = require('pg');
+const https    = require('https');
+const http     = require('http');
 
 const app  = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 // ── Database ──────────────────────────────────────────────────────────────────
-// Fallback to hardcoded connection string if env var isn't set
+// Use the EXTERNAL hostname — .internal only works if services are linked in Render
 const DATABASE_URL = process.env.DATABASE_URL
-  || 'postgresql://server_login_mgr_user:TrqUTHQt5H29h5oHlDglqGKuUGRTokNA@dpg-d7knlipj2pic73cbng30-a.internal/server_login_mgr';
+  || 'postgresql://server_login_mgr_user:TrqUTHQt5H29h5oHlDglqGKuUGRTokNA@dpg-d7knlipj2pic73cbng30-a.oregon-postgres.render.com/server_login_mgr';
 
-if(!DATABASE_URL){
-  console.error('❌ No DATABASE_URL available.');
-  process.exit(1);
-}
-
-console.log('🔌 Connecting to DB:', DATABASE_URL.replace(/:\/\/.*@/, '://***@'));
+console.log('🔌 Connecting to DB:', DATABASE_URL.replace(/:\/\/[^@]+@/, '://***@'));
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes('.internal') ? false : { rejectUnauthorized: false },
-  connectionTimeoutMillis: 10000,
+  ssl: { rejectUnauthorized: false }, // always use SSL with external Render Postgres
+  connectionTimeoutMillis: 15000,
   idleTimeoutMillis: 30000,
+  max: 5,
 });
+
+// ── Simple fetch wrapper using built-in https/http modules ────────────────────
+// Avoids any dependency on axios or node-fetch — works on all Node versions
+function nodeFetch(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const lib = parsed.protocol === 'https:' ? https : http;
+    const reqOpts = {
+      hostname: parsed.hostname,
+      port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path:     parsed.pathname + parsed.search,
+      method:   opts.method || 'GET',
+      headers:  opts.headers || {},
+    };
+    const req = lib.request(reqOpts, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, text: () => Promise.resolve(data) }));
+    });
+    req.on('error', reject);
+    if(opts.body) req.write(opts.body);
+    req.end();
+  });
+}
 
 // Create tables on startup if they don't exist
 async function initDB() {
@@ -186,22 +209,15 @@ app.post('/auth/delete', async (req, res) => {
 });
 
 // ── Render API proxy ──────────────────────────────────────────────────────────
-// Receives: { _renderKey, _targetMethod, ...body }
-// Proxies to: https://api.render.com/v1/<path>
-// Returns the Render API response with CORS headers already set above.
-
 app.all('/render-api/*', async (req, res) => {
-  // Support both GET (query params) and POST (body) for flexibility
-  const params      = req.method === 'GET' ? req.query : req.body;
-  const renderKey   = params._renderKey;
+  const params       = req.method === 'GET' ? req.query : req.body;
+  const renderKey    = params._renderKey;
   const targetMethod = (params._targetMethod || req.method).toUpperCase();
 
   if (!renderKey) return err(res, 'Missing _renderKey', 401);
 
-  // Strip our private fields before forwarding body
-  const { _renderKey, _targetMethod, _svcId, _dbId, ...forwardBody } = params;
+  const { _renderKey, _targetMethod, _svcId, _dbId, _method, _targetPath, ...forwardBody } = params;
 
-  // Build the Render API URL: everything after /render-api
   const subPath  = req.path.replace(/^\/render-api/, '');
   const queryStr = Object.keys(req.query).filter(k => !k.startsWith('_')).length > 0
     ? '?' + new URLSearchParams(Object.fromEntries(
@@ -213,28 +229,22 @@ app.all('/render-api/*', async (req, res) => {
   console.log(`[render-api] ${targetMethod} ${url}`);
 
   try {
-    const fetchOpts = {
+    const body = (targetMethod !== 'GET' && Object.keys(forwardBody).length > 0)
+      ? JSON.stringify(forwardBody) : undefined;
+
+    const r    = await nodeFetch(url, {
       method:  targetMethod,
       headers: {
         'Authorization': `Bearer ${renderKey}`,
         'Content-Type':  'application/json',
         'Accept':        'application/json',
       },
-    };
-
-    // Only send a body for non-GET requests that have actual payload
-    if (targetMethod !== 'GET' && Object.keys(forwardBody).length > 0) {
-      fetchOpts.body = JSON.stringify(forwardBody);
-    }
-
-    const r    = await fetch(url, fetchOpts);
+      body,
+    });
     const text = await r.text();
-
-    res.status(r.status)
-       .set('Content-Type', 'application/json')
-       .send(text || '{"ok":true}');
+    res.status(r.status).set('Content-Type', 'application/json').send(text || '{"ok":true}');
   } catch (e) {
-    console.error('render-api proxy error:', e.message);
+    console.error('[render-api] error:', e.message);
     err(res, 'Proxy error: ' + e.message, 502);
   }
 });
@@ -341,26 +351,30 @@ app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'Desktop Simulator Backend', time: new Date().toISOString() });
 });
 
-// ── Self-ping keepalive (prevents Render free tier from sleeping) ──────────────
-// Pings itself every 10 minutes. Render spins down after ~15 min of inactivity.
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-setInterval(async () => {
-  try {
-    const r = await fetch(`${SELF_URL}/`);
-    console.log(`[keepalive] ping → ${r.status}`);
-  } catch (e) {
-    console.warn(`[keepalive] ping failed: ${e.message}`);
-  }
-}, 10 * 60 * 1000); // every 10 minutes
+// ── Self-ping keepalive ───────────────────────────────────────────────────────
+function startKeepalive() {
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(async () => {
+    try {
+      const r = await nodeFetch(SELF_URL + '/');
+      console.log(`[keepalive] ping → ${r.status}`);
+    } catch (e) {
+      console.warn(`[keepalive] ping failed: ${e.message}`);
+    }
+  }, 10 * 60 * 1000); // every 10 minutes
+  console.log(`[keepalive] started, pinging ${SELF_URL} every 10min`);
+}
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 initDB()
   .then(() => {
-    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      startKeepalive();
+    });
   })
   .catch(e => {
     console.error('Failed to initialise DB:', e.message);
-    console.error('Full error:', e);
-    console.error('Connection string (masked):', DATABASE_URL.replace(/:\/\/.*@/, '://***@'));
+    console.error('Connection string (masked):', DATABASE_URL.replace(/:\/\/[^@]+@/, '://***@'));
     process.exit(1);
   });
