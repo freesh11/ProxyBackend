@@ -263,8 +263,8 @@ function adminAuth(req, res, next){
   next();
 }
 
-// GET /admin/users — list all accounts (no config content, just metadata)
-app.get('/admin/users', adminAuth, async (req, res) => {
+// GET /admin/users — list all accounts
+app.all('/admin/users', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
       `SELECT username, hash, created_at, updated_at,
@@ -277,16 +277,16 @@ app.get('/admin/users', adminAuth, async (req, res) => {
   }catch(e){ err(res, e.message, 500); }
 });
 
-// POST /admin/users/:username/delete — delete a specific user
-app.post('/admin/users/:username/delete', adminAuth, async (req, res) => {
+// POST /admin/users/:username/delete
+app.all('/admin/users/:username/delete', adminAuth, async (req, res) => {
   try{
     await pool.query('DELETE FROM accounts WHERE username = $1', [req.params.username]);
     res.json({ ok: true });
   }catch(e){ err(res, e.message, 500); }
 });
 
-// POST /admin/users/:username/wipe-config — clear config for a user
-app.post('/admin/users/:username/wipe-config', adminAuth, async (req, res) => {
+// POST /admin/users/:username/wipe-config
+app.all('/admin/users/:username/wipe-config', adminAuth, async (req, res) => {
   try{
     await pool.query(
       'UPDATE accounts SET config = NULL, updated_at = NOW() WHERE username = $1',
@@ -296,8 +296,8 @@ app.post('/admin/users/:username/wipe-config', adminAuth, async (req, res) => {
   }catch(e){ err(res, e.message, 500); }
 });
 
-// GET /admin/db/stats — database statistics
-app.get('/admin/db/stats', adminAuth, async (req, res) => {
+// GET /admin/db/stats
+app.all('/admin/db/stats', adminAuth, async (req, res) => {
   try{
     const [counts, sizes, dates] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total, COUNT(config) AS with_config FROM accounts`),
@@ -317,11 +317,10 @@ app.get('/admin/db/stats', adminAuth, async (req, res) => {
   }catch(e){ err(res, e.message, 500); }
 });
 
-// POST /admin/db/query — run a read-only SELECT query
-app.post('/admin/db/query', adminAuth, async (req, res) => {
-  const { sql } = req.body || {};
+// POST /admin/db/query — SELECT only
+app.all('/admin/db/query', adminAuth, async (req, res) => {
+  const sql = req.body?.sql || req.query?.sql;
   if(!sql) return err(res, 'No SQL provided');
-  // Safety: only allow SELECT statements
   const trimmed = sql.trim().toLowerCase();
   if(!trimmed.startsWith('select') && !trimmed.startsWith('with')){
     return err(res, 'Only SELECT queries are allowed');
@@ -332,8 +331,8 @@ app.post('/admin/db/query', adminAuth, async (req, res) => {
   }catch(e){ err(res, e.message, 400); }
 });
 
-// GET /admin/logs — return recent in-memory log lines
-app.get('/admin/logs', adminAuth, (req, res) => {
+// GET /admin/logs
+app.all('/admin/logs', adminAuth, (req, res) => {
   res.json({ ok: true, logs: [..._logs].reverse() });
 });
 
