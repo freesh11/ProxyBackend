@@ -116,10 +116,14 @@ app.post("/auth/delete", async (req, res) => {
 // ── Render API proxy — forwards requests to api.render.com server-side (avoids CORS) ──
 const RENDER_API_KEY = 'rnd_fxIXYSbs0NJWajIOVoIWDILZUECH';
 
-app.all("/render-api/*", async (req, res) => {
-  const path = req.params[0];
+app.all("/render-api*", async (req, res) => {
+  // Strip the /render-api prefix to get the Render API path
+  const apiPath = req.path.replace(/^\/render-api/, '') || '/';
   const query = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
-  const url = `https://api.render.com/v1/${path}${query}`;
+  const url = `https://api.render.com/v1${apiPath}${query}`;
+
+  console.log(`[render-api] ${req.method} ${url}`);
+
   try {
     const response = await axios({
       method: req.method,
@@ -134,6 +138,7 @@ app.all("/render-api/*", async (req, res) => {
     });
     res.status(response.status).json(response.data);
   } catch (e) {
+    console.error('[render-api] error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
