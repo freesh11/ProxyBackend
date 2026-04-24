@@ -22,14 +22,20 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Database ──────────────────────────────────────────────────────────────────
-if(!process.env.DATABASE_URL){
-  console.error('❌ DATABASE_URL environment variable is not set. Add it in the Render dashboard.');
+// Fallback to hardcoded connection string if env var isn't set
+const DATABASE_URL = process.env.DATABASE_URL
+  || 'postgresql://server_login_mgr_user:TrqUTHQt5H29h5oHlDglqGKuUGRTokNA@dpg-d7knlipj2pic73cbng30-a.internal/server_login_mgr';
+
+if(!DATABASE_URL){
+  console.error('❌ No DATABASE_URL available.');
   process.exit(1);
 }
 
+console.log('🔌 Connecting to DB:', DATABASE_URL.replace(/:\/\/.*@/, '://***@'));
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes('.internal') ? false : { rejectUnauthorized: false },
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
 });
@@ -356,7 +362,6 @@ initDB()
   .catch(e => {
     console.error('Failed to initialise DB:', e.message);
     console.error('Full error:', e);
-    console.error('DATABASE_URL set:', !!process.env.DATABASE_URL);
-    console.error('DATABASE_URL preview:', process.env.DATABASE_URL ? process.env.DATABASE_URL.slice(0,40)+'…' : 'NOT SET');
+    console.error('Connection string (masked):', DATABASE_URL.replace(/:\/\/.*@/, '://***@'));
     process.exit(1);
   });
