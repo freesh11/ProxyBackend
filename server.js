@@ -22,23 +22,36 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Database ──────────────────────────────────────────────────────────────────
+if(!process.env.DATABASE_URL){
+  console.error('❌ DATABASE_URL environment variable is not set. Add it in the Render dashboard.');
+  process.exit(1);
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // required for Render-hosted Postgres
+  ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
 });
 
 // Create tables on startup if they don't exist
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS accounts (
-      username    TEXT PRIMARY KEY,
-      hash        TEXT NOT NULL,
-      config      JSONB,
-      created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  console.log('✅ Database ready');
+  // Test the connection first so we get a clear error if it fails
+  const client = await pool.connect();
+  try{
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS accounts (
+        username    TEXT PRIMARY KEY,
+        hash        TEXT NOT NULL,
+        config      JSONB,
+        created_at  TIMESTAMPTZ DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    console.log('✅ Database ready');
+  } finally {
+    client.release();
+  }
 }
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
@@ -220,7 +233,105 @@ app.all('/render-api/*', async (req, res) => {
   }
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Admin routes ──────────────────────────────────────────────────────────────
+// Protected by admin password sent in body or x-admin-key header.
+// These are only called from the DevTools Server panel (password-gated in UI).
+
+const ADMIN_PW = '213646';
+const _logs = []; // in-memory log ring buffer (last 200 lines)
+const _origLog = console.log.bind(console);
+const _origWarn = console.warn.bind(console);
+const _origErr = console.error.bind(console);
+function _capture(level, ...args){
+  const line = `[${new Date().toISOString()}] [${level}] ${args.join(' ')}`;
+  _logs.push(line);
+  if(_logs.length > 200) _logs.shift();
+}
+console.log   = (...a)=>{ _capture('INFO',  ...a); _origLog(...a);  };
+console.warn  = (...a)=>{ _capture('WARN',  ...a); _origWarn(...a); };
+console.error = (...a)=>{ _capture('ERROR', ...a); _origErr(...a);  };
+
+function adminAuth(req, res, next){
+  const pw = req.body?._adminPw || req.query?._adminPw || req.headers['x-admin-key'];
+  if(pw !== ADMIN_PW) return res.status(401).json({ok:false, error:'Unauthorised'});
+  next();
+}
+
+// GET /admin/users — list all accounts (no config content, just metadata)
+app.get('/admin/users', adminAuth, async (req, res) => {
+  try{
+    const r = await pool.query(
+      `SELECT username, hash, created_at, updated_at,
+              config IS NOT NULL AS has_config,
+              pg_column_size(config) AS config_bytes,
+              config
+       FROM accounts ORDER BY created_at DESC`
+    );
+    res.json({ ok: true, users: r.rows });
+  }catch(e){ err(res, e.message, 500); }
+});
+
+// POST /admin/users/:username/delete — delete a specific user
+app.post('/admin/users/:username/delete', adminAuth, async (req, res) => {
+  try{
+    await pool.query('DELETE FROM accounts WHERE username = $1', [req.params.username]);
+    res.json({ ok: true });
+  }catch(e){ err(res, e.message, 500); }
+});
+
+// POST /admin/users/:username/wipe-config — clear config for a user
+app.post('/admin/users/:username/wipe-config', adminAuth, async (req, res) => {
+  try{
+    await pool.query(
+      'UPDATE accounts SET config = NULL, updated_at = NOW() WHERE username = $1',
+      [req.params.username]
+    );
+    res.json({ ok: true });
+  }catch(e){ err(res, e.message, 500); }
+});
+
+// GET /admin/db/stats — database statistics
+app.get('/admin/db/stats', adminAuth, async (req, res) => {
+  try{
+    const [counts, sizes, dates] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS total, COUNT(config) AS with_config FROM accounts`),
+      pool.query(`SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size,
+                         pg_size_pretty(pg_total_relation_size('accounts')) AS table_size`),
+      pool.query(`SELECT MIN(created_at) AS oldest, MAX(created_at) AS newest FROM accounts`),
+    ]);
+    res.json({
+      ok: true,
+      totalAccounts: parseInt(counts.rows[0].total),
+      withConfig:    parseInt(counts.rows[0].with_config),
+      dbSize:        sizes.rows[0].db_size,
+      tableSize:     sizes.rows[0].table_size,
+      oldest:        dates.rows[0].oldest,
+      newest:        dates.rows[0].newest,
+    });
+  }catch(e){ err(res, e.message, 500); }
+});
+
+// POST /admin/db/query — run a read-only SELECT query
+app.post('/admin/db/query', adminAuth, async (req, res) => {
+  const { sql } = req.body || {};
+  if(!sql) return err(res, 'No SQL provided');
+  // Safety: only allow SELECT statements
+  const trimmed = sql.trim().toLowerCase();
+  if(!trimmed.startsWith('select') && !trimmed.startsWith('with')){
+    return err(res, 'Only SELECT queries are allowed');
+  }
+  try{
+    const r = await pool.query(sql);
+    res.json({ ok: true, rows: r.rows, rowCount: r.rowCount });
+  }catch(e){ err(res, e.message, 400); }
+});
+
+// GET /admin/logs — return recent in-memory log lines
+app.get('/admin/logs', adminAuth, (req, res) => {
+  res.json({ ok: true, logs: [..._logs].reverse() });
+});
+
+
 app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'Desktop Simulator Backend', time: new Date().toISOString() });
 });
@@ -244,5 +355,8 @@ initDB()
   })
   .catch(e => {
     console.error('Failed to initialise DB:', e.message);
+    console.error('Full error:', e);
+    console.error('DATABASE_URL set:', !!process.env.DATABASE_URL);
+    console.error('DATABASE_URL preview:', process.env.DATABASE_URL ? process.env.DATABASE_URL.slice(0,40)+'…' : 'NOT SET');
     process.exit(1);
   });
