@@ -1,7 +1,4 @@
 const express = require("express");
-const axios   = require("axios");
-const cheerio = require("cheerio");
-const urlLib  = require("url");
 const { Pool } = require("pg");
 
 const app  = express();
@@ -38,7 +35,6 @@ app.use((req, res, next) => {
   next();
 });
 
-function resolveUrl(base, relative) { return urlLib.resolve(base, relative); }
 function ok(res, data)  { res.json({ ok: true,  ...data }); }
 function fail(res, msg) { res.json({ ok: false, error: msg }); }
 
@@ -141,24 +137,6 @@ app.all("/render-api*", async (req, res) => {
     console.error('[render-api] error:', e.message);
     res.status(500).json({ error: e.message });
   }
-});
-
-// ── Web proxy ─────────────────────────────────────────────────────────────────
-app.get("/proxy", async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.send("No URL provided");
-  try {
-    const response = await axios.get(target, {
-      responseType: "text",
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    const $ = cheerio.load(response.data);
-    $("a").each((_, el) => {
-      const href = $(el).attr("href");
-      if (href) $(el).attr("href", "/proxy?url=" + resolveUrl(target, href));
-    });
-    res.send($.html());
-  } catch (e) { res.send("Error loading page"); }
 });
 
 app.listen(PORT, () => {
