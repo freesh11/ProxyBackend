@@ -147,6 +147,7 @@ app.post('/auth/login', async (req, res) => {
 app.post('/auth/save-config', async (req, res) => {
   const { username, hash, config } = req.body || {};
   if (!username || !hash) return err(res, 'Missing credentials.');
+  if (config === undefined) return err(res, 'Missing config.');
 
   try {
     const result = await pool.query(
@@ -156,10 +157,13 @@ app.post('/auth/save-config', async (req, res) => {
     if (result.rows.length === 0) return err(res, 'Account not found.');
     if (result.rows[0].hash !== hash) return err(res, 'Incorrect password.');
 
+    // Pass config directly — pg driver serialises objects to JSONB automatically.
+    // Do NOT JSON.stringify here — that causes double-encoding.
     await pool.query(
       'UPDATE accounts SET config = $1, updated_at = NOW() WHERE username = $2',
-      [config ? JSON.stringify(config) : null, username]
+      [config, username]
     );
+    console.log(`[save-config] saved config for ${username} (${JSON.stringify(config).length} bytes)`);
     ok(res);
   } catch (e) {
     console.error('save-config error:', e.message);
@@ -268,13 +272,25 @@ console.warn  = (...a)=>{ _capture('WARN',  ...a); _origWarn(...a); };
 console.error = (...a)=>{ _capture('ERROR', ...a); _origErr(...a);  };
 
 function adminAuth(req, res, next){
-  const pw = req.body?._adminPw || req.query?._adminPw || req.headers['x-admin-key'];
-  if(pw !== ADMIN_PW) return res.status(401).json({ok:false, error:'Unauthorised'});
+  // Accept password from body (POST), query string (GET), or header
+  const pw = (req.body && req.body._adminPw)
+          || (req.query && req.query._adminPw)
+          || req.headers['x-admin-key'];
+  if(!pw || String(pw) !== String(ADMIN_PW)){
+    console.warn('[admin] rejected request — wrong or missing password');
+    return res.status(401).json({ok:false, error:'Unauthorised'});
+  }
   next();
 }
 
+// POST /admin/ping — test that admin auth works
+app.all('/admin/ping', adminAuth, (req, res) => {
+  res.json({ ok: true, message: 'Admin auth working', time: new Date().toISOString() });
+});
+
 // GET /admin/users — list all accounts
 app.all('/admin/users', adminAuth, async (req, res) => {
+  console.log('[admin] listing users');
   try{
     const r = await pool.query(
       `SELECT username, hash, created_at, updated_at,
@@ -283,12 +299,17 @@ app.all('/admin/users', adminAuth, async (req, res) => {
               config
        FROM accounts ORDER BY created_at DESC`
     );
+    console.log(`[admin] found ${r.rows.length} users`);
     res.json({ ok: true, users: r.rows });
-  }catch(e){ err(res, e.message, 500); }
+  }catch(e){
+    console.error('[admin] users error:', e.message);
+    err(res, e.message, 500);
+  }
 });
 
 // POST /admin/users/:username/delete
 app.all('/admin/users/:username/delete', adminAuth, async (req, res) => {
+  console.log('[admin] deleting user:', req.params.username);
   try{
     await pool.query('DELETE FROM accounts WHERE username = $1', [req.params.username]);
     res.json({ ok: true });
@@ -297,6 +318,7 @@ app.all('/admin/users/:username/delete', adminAuth, async (req, res) => {
 
 // POST /admin/users/:username/wipe-config
 app.all('/admin/users/:username/wipe-config', adminAuth, async (req, res) => {
+  console.log('[admin] wiping config for:', req.params.username);
   try{
     await pool.query(
       'UPDATE accounts SET config = NULL, updated_at = NOW() WHERE username = $1',
@@ -308,6 +330,7 @@ app.all('/admin/users/:username/wipe-config', adminAuth, async (req, res) => {
 
 // GET /admin/db/stats
 app.all('/admin/db/stats', adminAuth, async (req, res) => {
+  console.log('[admin] fetching db stats');
   try{
     const [counts, sizes, dates] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total, COUNT(config) AS with_config FROM accounts`),
@@ -324,21 +347,28 @@ app.all('/admin/db/stats', adminAuth, async (req, res) => {
       oldest:        dates.rows[0].oldest,
       newest:        dates.rows[0].newest,
     });
-  }catch(e){ err(res, e.message, 500); }
+  }catch(e){
+    console.error('[admin] db/stats error:', e.message);
+    err(res, e.message, 500);
+  }
 });
 
 // POST /admin/db/query — SELECT only
 app.all('/admin/db/query', adminAuth, async (req, res) => {
-  const sql = req.body?.sql || req.query?.sql;
+  const sql = (req.body && req.body.sql) || (req.query && req.query.sql);
   if(!sql) return err(res, 'No SQL provided');
   const trimmed = sql.trim().toLowerCase();
   if(!trimmed.startsWith('select') && !trimmed.startsWith('with')){
     return err(res, 'Only SELECT queries are allowed');
   }
+  console.log('[admin] running query:', sql.slice(0,80));
   try{
     const r = await pool.query(sql);
     res.json({ ok: true, rows: r.rows, rowCount: r.rowCount });
-  }catch(e){ err(res, e.message, 400); }
+  }catch(e){
+    console.error('[admin] query error:', e.message);
+    err(res, e.message, 400);
+  }
 });
 
 // GET /admin/logs
