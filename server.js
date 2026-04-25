@@ -65,9 +65,9 @@ function nodeFetch(url, opts = {}) {
 
 // Create tables on startup if they don't exist
 async function initDB() {
-  // Test the connection first so we get a clear error if it fails
   const client = await pool.connect();
   try{
+    // Create table if it doesn't exist
     await client.query(`
       CREATE TABLE IF NOT EXISTS accounts (
         username    TEXT PRIMARY KEY,
@@ -77,6 +77,17 @@ async function initDB() {
         updated_at  TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+
+    // Migration: add updated_at if the table existed before without it
+    await client.query(`
+      ALTER TABLE accounts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+    `);
+
+    // Migration: add created_at if missing too
+    await client.query(`
+      ALTER TABLE accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    `);
+
     console.log('✅ Database ready');
   } finally {
     client.release();
